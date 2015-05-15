@@ -20,39 +20,21 @@
  *
  */
 
-#ifdef linux
-#define _GNU_SOURCE
 #include <sched.h>
-#endif
 #include <stdio.h>
 #include <stdlib.h>
-#ifdef WIN32
-#include <winsock2.h> /* winsock.h is included automatically */
-#include <process.h>
-#include <io.h>
-#include <getopt.h>
-#define getopt getopt____
-#else
 #include <unistd.h>
 #include <netinet/in.h>
-#endif
 #include <string.h>
 #include <stdarg.h>
 #include <search.h>
 #include <pcap.h>
 #include <signal.h>
-#include <pthread.h>
-
-#ifdef HAVE_JSON_C
-#include <json.h>
-#endif
 
 #include "ndpi_api.h"
 #include "ndpiReader.h"
 
 #include <sys/socket.h>
-
-#define MAX_NUM_READER_THREADS     1
 
 /**
  * @brief Set main components necessary to the detection
@@ -63,29 +45,16 @@ static void setupDetection();
 /**
  * Client parameters
  */
-static FILE *playlist_fp[MAX_NUM_READER_THREADS] = { NULL }; /**< Ingress playlist */
-static char *_bpf_filter      = NULL; /**< bpf filter  */
 static char *_protoFilePath   = NULL; /**< Protocol file path  */
-#ifdef HAVE_JSON_C
-static char *_jsonFilePath    = NULL; /**< JSON file path  */
-#endif
-#ifdef HAVE_JSON_C
-static json_object *jArray_known_flows, *jArray_unknown_flows;
-#endif
 static u_int8_t live_capture = 0, full_http_dissection = 0;
 static u_int8_t undetected_flows_deleted = 0;
 /**
  * User preferences
  */
-static u_int8_t enable_protocol_guess = 1, verbose = 0, nDPI_traceLevel = 0, json_flag = 0;
+static u_int8_t enable_protocol_guess = 1, nDPI_traceLevel = 0;
 static u_int16_t decode_tunnels = 0;
 static u_int16_t num_loops = 1;
-static u_int8_t shutdown_app = 0;
-static u_int8_t num_threads = 1;
 static u_int32_t current_ndpi_memory = 0, max_ndpi_memory = 0;
-#ifdef linux
-static int core_affinity[MAX_NUM_READER_THREADS];
-#endif
 
 static struct timeval pcap_start, pcap_end;
 
@@ -94,7 +63,6 @@ static struct timeval pcap_start, pcap_end;
  */
 static u_int32_t detection_tick_resolution = 1000;
 static time_t capture_for = 0;
-static time_t capture_until = 0;
 
 #define IDLE_SCAN_PERIOD           10 /* msec (use detection_tick_resolution = 1000) */
 #define MAX_IDLE_TIME           30000
@@ -122,8 +90,6 @@ struct thread_stats {
 struct reader_thread {
     struct ndpi_detection_module_struct *ndpi_struct;
     void *ndpi_flows_root[NUM_ROOTS];
-    char _pcap_error_buffer[PCAP_ERRBUF_SIZE];
-    pcap_t *_pcap_handle;
     u_int64_t last_time;
     u_int64_t last_idle_scan_time;
     u_int32_t idle_scan_idx;
@@ -136,7 +102,6 @@ struct reader_thread {
     struct ndpi_flow *idle_flows[IDLE_SCAN_BUDGET];
 };
 
-// static struct reader_thread ndpi_info[MAX_NUM_READER_THREADS];
 static struct reader_thread ndpi_info;
 
 #define GTP_U_V1_PORT        2152
@@ -192,19 +157,17 @@ static void debug_printf(u_int32_t protocol, void *id_struct,
         ndpi_log_level_t log_level,
         const char *format, ...) {
     va_list va_ap;
-#ifndef WIN32
     struct tm result;
-#endif
 
-    if(log_level <= nDPI_traceLevel) {
+    if (log_level <= nDPI_traceLevel) {
         char buf[8192], out_buf[8192];
         char theDate[32];
         const char *extra_msg = "";
         time_t theTime = time(NULL);
 
-        va_start (va_ap, format);
+        va_start(va_ap, format);
 
-        if(log_level == NDPI_LOG_ERROR)
+        if (log_level == NDPI_LOG_ERROR)
             extra_msg = "ERROR: ";
         else if(log_level == NDPI_LOG_TRACE)
             extra_msg = "TRACE: ";
@@ -270,74 +233,25 @@ static char* ipProto2Name(u_short proto_id) {
 /* ***************************************************** */
 
 static void printFlow(struct ndpi_flow *flow) {
-#ifdef HAVE_JSON_C
-    json_object *jObj;
-#endif
+    printf("\t%u", ++num_flows);
 
-    if(!json_flag) {
-#if 0
-        printf("\t%s [VLAN: %u] %s:%u <-> %s:%u\n",
-                ipProto2Name(flow->protocol), flow->vlan_id,
-                flow->lower_name, ntohs(flow->lower_port),
-                flow->upper_name, ntohs(flow->upper_port));
+    printf("\t%s %s:%u <-> %s:%u ",
+            ipProto2Name(flow->protocol),
+            flow->lower_name, ntohs(flow->lower_port),
+            flow->upper_name, ntohs(flow->upper_port));
 
-#else
-        printf("\t%u", ++num_flows);
+    if(flow->vlan_id > 0) printf("[VLAN: %u]", flow->vlan_id);
 
-        printf("\t%s %s:%u <-> %s:%u ",
-                ipProto2Name(flow->protocol),
-                flow->lower_name, ntohs(flow->lower_port),
-                flow->upper_name, ntohs(flow->upper_port));
+    printf("[proto: %u/%s][%u pkts/%llu bytes]",
+            flow->detected_protocol,
+            ndpi_get_proto_name(ndpi_info.ndpi_struct, flow->detected_protocol),
+            flow->packets, (long long unsigned int)flow->bytes);
 
-        if(flow->vlan_id > 0) printf("[VLAN: %u]", flow->vlan_id);
+    if(flow->host_server_name[0] != '\0') printf("[Host: %s]", flow->host_server_name);
+    if(flow->ssl.client_certificate[0] != '\0') printf("[SSL client: %s]", flow->ssl.client_certificate);
+    if(flow->ssl.server_certificate[0] != '\0') printf("[SSL server: %s]", flow->ssl.server_certificate);
 
-        printf("[proto: %u/%s][%u pkts/%llu bytes]",
-                flow->detected_protocol,
-                ndpi_get_proto_name(ndpi_info.ndpi_struct, flow->detected_protocol),
-                flow->packets, (long long unsigned int)flow->bytes);
-
-        if(flow->host_server_name[0] != '\0') printf("[Host: %s]", flow->host_server_name);
-        if(flow->ssl.client_certificate[0] != '\0') printf("[SSL client: %s]", flow->ssl.client_certificate);
-        if(flow->ssl.server_certificate[0] != '\0') printf("[SSL server: %s]", flow->ssl.server_certificate);
-
-        printf("\n");
-#endif
-    } else {
-#ifdef HAVE_JSON_C
-        jObj = json_object_new_object();
-
-        json_object_object_add(jObj,"protocol",json_object_new_string(ipProto2Name(flow->protocol)));
-        json_object_object_add(jObj,"host_a.name",json_object_new_string(flow->lower_name));
-        json_object_object_add(jObj,"host_a.port",json_object_new_int(ntohs(flow->lower_port)));
-        json_object_object_add(jObj,"host_b.name",json_object_new_string(flow->upper_name));
-        json_object_object_add(jObj,"host_n.port",json_object_new_int(ntohs(flow->upper_port)));
-        json_object_object_add(jObj,"detected.protocol",json_object_new_int(flow->detected_protocol));
-        json_object_object_add(jObj,"detected.protocol.name",json_object_new_string(ndpi_get_proto_name(ndpi_info.ndpi_struct, flow->detected_protocol)));
-        json_object_object_add(jObj,"packets",json_object_new_int(flow->packets));
-        json_object_object_add(jObj,"bytes",json_object_new_int(flow->bytes));
-
-        if(flow->host_server_name[0] != '\0')
-            json_object_object_add(jObj,"host.server.name",json_object_new_string(flow->host_server_name));
-
-        if((flow->ssl.client_certificate[0] != '\0') || (flow->ssl.server_certificate[0] != '\0')) {
-            json_object *sjObj = json_object_new_object();
-
-            if(flow->ssl.client_certificate[0] != '\0')
-                json_object_object_add(sjObj, "client", json_object_new_string(flow->ssl.client_certificate));
-
-            if(flow->ssl.server_certificate[0] != '\0')
-                json_object_object_add(sjObj, "server", json_object_new_string(flow->ssl.server_certificate));
-
-            json_object_object_add(jObj, "ssl", sjObj);
-        }
-
-        //flow->protos.ssl.client_certificate, flow->protos.ssl.server_certificate);
-        if(json_flag == 1)
-            json_object_array_add(jArray_known_flows,jObj);
-        else if(json_flag == 2)
-            json_object_array_add(jArray_unknown_flows,jObj);
-#endif
-    }
+    printf("\n");
 }
 
 /* ***************************************************** */
@@ -898,15 +812,6 @@ char* formatPackets(float numPkts, char *buf) {
 
 /* ***************************************************** */
 
-#ifdef HAVE_JSON_C
-static void json_init() {
-    jArray_known_flows = json_object_new_array();
-    jArray_unknown_flows = json_object_new_array();
-}
-#endif
-
-/* ***************************************************** */
-
 char* formatBytes(u_int32_t howMuch, char *buf, u_int buf_len) {
     char unit = 'B';
 
@@ -1084,8 +989,28 @@ static void printResults(u_int64_t tot_usec) {
 
 /* ***************************************************** */
 
-static void pcap_packet_callback(u_char *args, const struct pcap_pkthdr *header, const u_char *packet) {
+int calculateTypeAndIpOffset(u_int16_t *type, u_int16_t *ip_offset, const u_int8_t *packet) {
     const struct ndpi_ethhdr *ethernet;
+
+    if (ndpi_info._pcap_datalink_type == DLT_NULL) {
+        if (ntohl(*((u_int32_t*) packet)) == 2)
+            *type = ETH_P_IP;
+        else
+            *type = 0x86DD; /* IPv6 */
+        *ip_offset = 4;
+    } else if (ndpi_info._pcap_datalink_type == DLT_EN10MB) {
+        ethernet = (struct ndpi_ethhdr *) packet;
+        *ip_offset = sizeof(struct ndpi_ethhdr);
+        *type = ntohs(ethernet->h_proto);
+    } else if (ndpi_info._pcap_datalink_type == 113 /* Linux Cooked Capture */) {
+        *type = (packet[14] << 8) + packet[15];
+        *ip_offset = 16;
+    } else 
+        return 0;
+    return 1;
+}
+
+static void pcap_packet_callback(u_char *args, const struct pcap_pkthdr *header, const u_char *packet) {
     struct ndpi_iphdr *iph;
     struct ndpi_ip6_hdr *iph6;
     u_int64_t time;
@@ -1094,14 +1019,6 @@ static void pcap_packet_callback(u_char *args, const struct pcap_pkthdr *header,
     u_int8_t proto = 0, vlan_packet = 0;
 
     ndpi_info.stats.raw_packet_count++;
-
-    /*
-    if ((capture_until != 0) && (header->ts.tv_sec >= capture_until)) {
-        if (ndpi_info._pcap_handle != NULL)
-            pcap_breakloop(ndpi_info._pcap_handle);
-        return;
-    }
-    */
 
     if (!live_capture) {
         if (!pcap_start.tv_sec) pcap_start.tv_sec = header->ts.tv_sec, pcap_start.tv_usec = header->ts.tv_usec;
@@ -1117,21 +1034,7 @@ static void pcap_packet_callback(u_char *args, const struct pcap_pkthdr *header,
     }
     ndpi_info.last_time = time;
 
-    if(ndpi_info._pcap_datalink_type == DLT_NULL) {
-        if(ntohl(*((u_int32_t*)packet)) == 2)
-            type = ETH_P_IP;
-        else
-            type = 0x86DD; /* IPv6 */
-
-        ip_offset = 4;
-    } else if(ndpi_info._pcap_datalink_type == DLT_EN10MB) {
-        ethernet = (struct ndpi_ethhdr *) packet;
-        ip_offset = sizeof(struct ndpi_ethhdr);
-        type = ntohs(ethernet->h_proto);
-    } else if(ndpi_info._pcap_datalink_type == 113 /* Linux Cooked Capture */) {
-        type = (packet[14] << 8) + packet[15];
-        ip_offset = 16;
-    } else
+    if (!calculateTypeAndIpOffset(&type, &ip_offset, packet))
         return;
 
     while(1) {
@@ -1163,7 +1066,7 @@ static void pcap_packet_callback(u_char *args, const struct pcap_pkthdr *header,
     iph = (struct ndpi_iphdr *) &packet[ip_offset];
 
     // just work on Ethernet packets that contain IP
-    if(type == ETH_P_IP && header->caplen >= ip_offset) {
+    if (type == ETH_P_IP && header->caplen >= ip_offset) {
         frag_off = ntohs(iph->frag_off);
 
         proto = iph->protocol;
@@ -1171,13 +1074,13 @@ static void pcap_packet_callback(u_char *args, const struct pcap_pkthdr *header,
             static u_int8_t cap_warning_used = 0;
 
             if(cap_warning_used == 0) {
-                if(!json_flag) printf("\n\nWARNING: packet capture size is smaller than packet size, DETECTION MIGHT NOT WORK CORRECTLY\n\n");
+                printf("\n\nWARNING: packet capture size is smaller than packet size, DETECTION MIGHT NOT WORK CORRECTLY\n\n");
                 cap_warning_used = 1;
             }
         }
     }
 
-    if(iph->version == 4) {
+    if (iph->version == 4) {
         ip_len = ((u_short)iph->ihl * 4);
         iph6 = NULL;
 
@@ -1186,7 +1089,7 @@ static void pcap_packet_callback(u_char *args, const struct pcap_pkthdr *header,
 
             ndpi_info.stats.fragmented_count++;
             if(ipv4_frags_warning_used == 0) {
-                if(!json_flag) printf("\n\nWARNING: IPv4 fragments are not handled by this demo (nDPI supports them)\n");
+                printf("\n\nWARNING: IPv4 fragments are not handled by this demo (nDPI supports them)\n");
                 ipv4_frags_warning_used = 1;
             }
 
@@ -1211,7 +1114,7 @@ static void pcap_packet_callback(u_char *args, const struct pcap_pkthdr *header,
 
 v4_warning:
         if(ipv4_warning_used == 0) {
-            if(!json_flag) printf("\n\nWARNING: only IPv4/IPv6 packets are supported in this demo (nDPI supports both IPv4 and IPv6), all other packets will be discarded\n\n");
+            printf("\n\nWARNING: only IPv4/IPv6 packets are supported in this demo (nDPI supports both IPv4 and IPv6), all other packets will be discarded\n\n");
             ipv4_warning_used = 1;
         }
 
@@ -1219,7 +1122,7 @@ v4_warning:
         return;
     }
 
-    if(decode_tunnels && (proto == IPPROTO_UDP)) {
+    if (decode_tunnels && (proto == IPPROTO_UDP)) {
         struct ndpi_udphdr *udp = (struct ndpi_udphdr *)&packet[ip_offset+ip_len];
         u_int16_t sport = ntohs(udp->source), dport = ntohs(udp->dest);
 
@@ -1274,53 +1177,6 @@ void processPacket(const struct pcap_pkthdr *header, const u_char *packet) {
 void finish() {
     gettimeofday(&end, NULL);
     tot_usec = end.tv_sec*1000000 + end.tv_usec - (begin.tv_sec*1000000 + begin.tv_usec);
-    // printResults(tot_usec);
+    printResults(tot_usec);
     terminateDetection();
 }
-
-/* ****************************************************** */
-
-#ifdef WIN32
-#ifndef __GNUC__
-#define EPOCHFILETIME (116444736000000000i64)
-#else
-#define EPOCHFILETIME (116444736000000000LL)
-#endif
-
-struct timezone {
-    int tz_minuteswest; /* minutes W of Greenwich */
-    int tz_dsttime;     /* type of dst correction */
-};
-
-/* ***************************************************** */
-
-int gettimeofday(struct timeval *tv, struct timezone *tz) {
-    FILETIME        ft;
-    LARGE_INTEGER   li;
-    __int64         t;
-    static int      tzflag;
-
-    if(tv) {
-        GetSystemTimeAsFileTime(&ft);
-        li.LowPart  = ft.dwLowDateTime;
-        li.HighPart = ft.dwHighDateTime;
-        t  = li.QuadPart;       /* In 100-nanosecond intervals */
-        t -= EPOCHFILETIME;     /* Offset to the Epoch time */
-        t /= 10;                /* In microseconds */
-        tv->tv_sec  = (long)(t / 1000000);
-        tv->tv_usec = (long)(t % 1000000);
-    }
-
-    if(tz) {
-        if(!tzflag) {
-            _tzset();
-            tzflag++;
-        }
-
-        tz->tz_minuteswest = _timezone / 60;
-        tz->tz_dsttime = _daylight;
-    }
-
-    return 0;
-}
-#endif /* WIN32 */
